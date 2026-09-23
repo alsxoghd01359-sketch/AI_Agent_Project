@@ -1,6 +1,8 @@
 # secrets
 .env
 
+scenario.txt
+
 # python
 __pycache__/
 *.pyc
