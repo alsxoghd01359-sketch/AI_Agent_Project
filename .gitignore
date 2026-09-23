@@ -2,7 +2,7 @@
 .env
 
 scenario.txt
-
+claude.md
 # python
 __pycache__/
 *.pyc
