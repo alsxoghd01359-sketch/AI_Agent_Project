@@ -1,7 +1,7 @@
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-PDF_PATH = ROOT_DIR / "던전앤드래곤 룰북.pdf"
+PDF_PATH = ROOT_DIR / "dnd_rulebook.pdf"
 SCENARIO_PATH = ROOT_DIR / "scenario.txt"
 
 RAW_DIR = ROOT_DIR / "data" / "raw"
