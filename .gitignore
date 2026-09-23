@@ -1,0 +1,13 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# generated / regeneratable vector store
+data/chroma_db/
+
+# copyrighted rulebook source — don't redistribute
+던전앤드래곤 룰북.pdf
