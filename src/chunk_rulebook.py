@@ -1,18 +1,14 @@
 """Turn extracted pages.json into RAG-ready chunks.
 
 Strategy:
-- Chapter 11 (주문/Spells) and Chapter 12 (괴물/Monsters, incl. NPCs) are
-  split per entry (one spell / one stat block = one chunk), detected via the
-  rulebook's consistent formatting:
-    spell entry header  = name line, followed by a line like "3레벨 변환계"
-    monster entry header = name line, followed by a line starting with
-                            초소형/소형/중형/대형/거대 (creature size)
-- Everything else (including the non-entry intro text inside chapters 11/12)
-  is first split at the rulebook's own subsection headings, recovered from
-  the table of contents on page 2 (e.g. "갑옷과 방패류", "휴식", "환경").
-  Each subsection becomes its own chunk so a chunk never mixes two topics.
-  A subsection that's still too long is further sliced into ~450-token
-  windows with a small overlap, breaking on line boundaries.
+- Spells (ch.11), monsters/NPCs (ch.12) and magic items (ch.14) become one chunk
+  per entry. Entry boundaries come from parse_entries.find_entries, the same
+  detection that builds data/structured/*.json, so chunks and JSON records agree.
+- Everything else (including the non-entry text inside those chapters) is first
+  split at the rulebook's own subsection headings, recovered from the table of
+  contents on page 2 (e.g. "갑옷과 방패류", "휴식", "환경"), so a chunk never
+  mixes two topics. A subsection that's still too long is further sliced into
+  ~450-token windows with a small overlap, breaking on line boundaries.
 """
 import json
 import re
@@ -20,11 +16,16 @@ import re
 import tiktoken
 
 from config import PAGES_JSON, CHUNKS_JSONL
+from parse_entries import load_chapter_lines, find_entries
 
-SPELL_HEADER_RE = re.compile(r"^(소마법|\d+레벨)\s*(\(0레벨\))?\s*\S*계\s*$")
-MONSTER_HEADER_RE = re.compile(r"^(초소형|소형|중형|대형|거대)\s+[가-힣/()]{1,12},\s*[가-힣\s]{1,15}$")
-NAME_SPLIT_RE = re.compile(r"^([가-힣][가-힣\s]*?)\s+([A-Za-z][A-Za-z0-9\s\-'/,.]*)$")
 TOC_LINE_RE = re.compile(r"^(.+?)[.\t ]{2,}(\d+)$")
+
+# chapter prefix -> (entry type, find_entries options, section label for its entries)
+ENTRY_CHAPTERS = {
+    "제11장": ("spell", {}, "주문 상세"),
+    "제12장": ("monster", {"stop_titles": ["논플레이어 캐릭터"]}, "괴물의 자료 상자"),
+    "제14장": ("magic_item", {"start_after": "물건 상세설명"}, "물건 상세설명"),
+}
 
 ENC = tiktoken.get_encoding("cl100k_base")
 
@@ -37,19 +38,9 @@ def load_pages():
         return json.load(f)
 
 
-def load_lines_by_chapter(pages):
-    chapters = {}  # chapter title -> list of (page_num, line)
-    order = []  # preserve first-seen order of chapters
-    for p in pages:
-        chapter = p["chapter"] or "미분류"
-        if chapter not in chapters:
-            chapters[chapter] = []
-            order.append(chapter)
-        for line in p["text"].split("\n"):
-            line = line.strip()
-            if line:
-                chapters[chapter].append((p["page_num"], line))
-    return order, chapters
+def _pairs(lines):
+    """(page, raw, style) -> (page, stripped text) for the generic chunkers."""
+    return [(p, raw.strip()) for p, raw, _ in lines]
 
 
 def norm(s: str) -> str:
@@ -87,34 +78,6 @@ def chapter_slug(chapter: str) -> str:
     if m:
         return f"appendix_{m.group(1)}"
     return re.sub(r"[^0-9a-zA-Z가-힣]+", "_", chapter)[:20] or "misc"
-
-
-def split_entries(lines, header_re):
-    """Split (page,line) tuples into [intro_lines, entry_lines, entry_lines, ...]
-    using header_re matched against line i while line i-1 is treated as the
-    entry's name header."""
-    header_starts = []
-    for i in range(1, len(lines)):
-        if header_re.match(lines[i][1]):
-            header_starts.append(i - 1)
-
-    if not header_starts:
-        return [lines], []
-
-    segments = []
-    intro = lines[: header_starts[0]]
-    for k, start in enumerate(header_starts):
-        end = header_starts[k + 1] if k + 1 < len(header_starts) else len(lines)
-        segments.append(lines[start:end])
-    return ([intro] if intro else []), segments
-
-
-def entry_name(lines):
-    raw = lines[0][1]
-    m = NAME_SPLIT_RE.match(raw)
-    if m:
-        return raw, m.group(1).strip(), m.group(2).strip()
-    return raw, raw, None
 
 
 def make_chunk(chunk_id, chapter, entry_type, lines, name=None, name_en=None, section=None):
@@ -208,39 +171,31 @@ def chunk_with_sections(slug, chapter, lines, subsection_titles, entry_type="rul
 
 def build_chunks():
     pages = load_pages()
-    order, chapters = load_lines_by_chapter(pages)
+    chapters = load_chapter_lines(pages)
     toc = parse_toc(pages)
     all_chunks = []
 
-    for chapter in order:
-        lines = chapters[chapter]
+    for chapter, lines in chapters.items():
         slug = chapter_slug(chapter)
         subsection_titles = toc.get(chapter, [])
+        spec = next((v for k, v in ENTRY_CHAPTERS.items() if chapter.startswith(k)), None)
 
-        if chapter.startswith("제11장"):
-            intros, entries = split_entries(lines, SPELL_HEADER_RE)
-            for intro in intros:
-                all_chunks.extend(
-                    chunk_with_sections(f"{slug}_intro", chapter, intro, subsection_titles)
+        if spec is None:
+            all_chunks.extend(chunk_with_sections(slug, chapter, _pairs(lines), subsection_titles))
+            continue
+
+        entry_type, options, section = spec
+        for g, seg in enumerate(find_entries(lines, entry_type, **options)):
+            if seg[0] == "gap":
+                if any(l.strip() == "논플레이어 캐릭터" for _, l, _ in seg[1]):
+                    section = "논플레이어 캐릭터"
+                all_chunks.extend(chunk_with_sections(f"{slug}_g{g}", chapter, _pairs(seg[1]), subsection_titles))
+            else:
+                meta = seg[2]
+                cid = f"{entry_type}_{re.sub(r'[^0-9a-zA-Z가-힣]+', '_', meta['name'])}"
+                all_chunks.append(
+                    make_chunk(cid, chapter, entry_type, _pairs(seg[1]), meta["name"], meta["name_en"], section=section)
                 )
-            for entry in entries:
-                raw_name, ko, en = entry_name(entry)
-                cid = f"spell_{re.sub(r'[^0-9a-zA-Z가-힣]+', '_', raw_name)}"
-                all_chunks.append(make_chunk(cid, chapter, "spell", entry, ko, en, section="주문 상세"))
-
-        elif chapter.startswith("제12장"):
-            intros, entries = split_entries(lines, MONSTER_HEADER_RE)
-            for intro in intros:
-                all_chunks.extend(
-                    chunk_with_sections(f"{slug}_intro", chapter, intro, subsection_titles)
-                )
-            for entry in entries:
-                raw_name, ko, en = entry_name(entry)
-                cid = f"monster_{re.sub(r'[^0-9a-zA-Z가-힣]+', '_', raw_name)}"
-                all_chunks.append(make_chunk(cid, chapter, "monster", entry, ko, en, section="괴물의 자료 상자"))
-
-        else:
-            all_chunks.extend(chunk_with_sections(slug, chapter, lines, subsection_titles))
 
     return all_chunks
 

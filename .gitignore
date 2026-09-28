@@ -11,5 +11,8 @@ __pycache__/
 # generated / regeneratable vector store
 data/chroma_db/
 
-# copyrighted rulebook source — don't redistribute
+# copyrighted rulebook source and everything derived from its text — don't redistribute.
+# Regenerate locally: extract_pdf.py -> parse_entries.py -> chunk_rulebook.py -> build_vectorstore.py
 dnd_rulebook.pdf
+data/raw/
+data/structured/

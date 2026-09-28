@@ -2,13 +2,14 @@
 
 The model (gpt-4o-mini) plays the Dungeon Master. It doesn't get the
 rulebook or the character sheet stuffed into every prompt — instead it
-decides for itself when to call `search_rulebook` (rules/spells/monsters)
-or read/update `character_sheet` (HP, inventory, conditions...) via tool
-calls, so context stays small and the numbers stay authoritative instead
-of hallucinated.
+decides for itself when to call `lookup_rulebook_entry` (exact spell /
+monster / magic-item data), `search_rulebook` (general rules), or read/update
+`character_sheet` (HP, inventory, conditions...) via tool calls, so context
+stays small and the numbers stay authoritative instead of hallucinated.
 """
 import json
 import os
+import random
 import re
 import uuid
 
@@ -16,6 +17,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from config import SCENARIO_PATH
+from entries import lookup, monster_for_label
 from retrieval import search_rulebook
 from character_sheets import (
     new_character_sheet, save_character, get_character,
@@ -52,19 +54,31 @@ SYSTEM_PROMPT = """당신은 던전즈 & 드래곤즈 5판(기초 규칙) TRPG�
   억지 설득 같은 부자연스러운 방법으로 원래 흐름으로 되돌리려 하지 마세요. 플레이어의 선택을
   그대로 존중하고, 그에 맞는 현실적인 결과(놓친 보상, NPC의 반응, 새로운 위험이나 기회 등)를 만들어
   이야기를 이어가세요. 플레이어의 자유의지가 항상 사전에 짜인 흐름보다 우선합니다.
-- 규칙, 주문, 괴물 스탯 등 룰북 내용이 필요하면 반드시 search_rulebook 도구로 확인 후 답하세요. 추측으로 규칙을 지어내지 마세요.
-- 전투나 사건으로 HP, 소지품, 상태이상 등이 바뀌면 반드시 update_character_sheet 도구로 실제 시트를 갱신하세요. 갱신하지 않으면 다음 판정에서 틀린 값을 쓰게 됩니다.
+- 특정 주문, 몬스터/NPC, 마법 물건의 수치(피해 주사위, 사거리, AC, HP, 도전지수, 공격 등)가 필요하면
+  반드시 lookup_rulebook_entry 도구로 정확한 데이터를 조회해 그 값대로 진행하세요. 일반적인 규칙
+  (기습, 엄폐, 휴식, 상태이상 등)은 search_rulebook 도구로 확인하세요. 추측으로 규칙이나 수치를
+  지어내지 마세요.
+- 몬스터와 전투를 시작하기 전에 lookup_rulebook_entry로 그 몬스터의 HP·AC·공격을 확인하세요.
+- HP 변화는 반드시 roll_attack 또는 change_hp 도구로만 처리하세요. 적·동료 NPC의 공격은
+  roll_attack으로 굴리고(명중 보너스와 피해 주사위는 lookup_rulebook_entry로 확인한 값 사용),
+  플레이어가 직접 굴려서 알려준 피해나 함정·물약 등의 피해/회복은 change_hp로 반영하세요.
+  주사위 결과나 명중 여부, 남은 HP를 직접 지어내거나 계산하지 말고 도구가 돌려준 값을 그대로 서술하세요.
+- 플레이어가 공격 굴림 결과를 알려주면 lookup_rulebook_entry로 확인한 대상 AC와 비교해 명중을 판정하세요
+  (명중 굴림 ≥ AC면 명중). 플레이어가 아직 굴리지 않았다면 어떤 주사위를 굴려야 하는지 알려주세요.
+- 소지품, 상태이상 등 HP 외의 변화는 update_character_sheet 도구로 시트를 갱신하세요.
 - 전투가 끝났다는 이유만으로 HP를 회복시키지 마세요. HP는 짧은 휴식/긴 휴식, 회복 주문, 물약 등
   명시적인 회복 수단을 사용했을 때만 늘어나야 하며, 그 외에는 전투 종료 후에도 깎인 상태 그대로
   유지되어야 합니다.
 - 캐릭터의 현재 상태(HP, 능력치 등)가 필요하면 get_character_sheet 도구로 확인하세요.
 - 판정이 필요한 상황(공격, 능력 판정, 내성 굴림 등)에서는 어떤 주사위를 굴려야 하는지, DC가 얼마인지 플레이어에게 명확히 알려주세요.
-- 전투가 시작되면 update_combat_status 도구로 참가자 전원(플레이어, 동료 NPC, 적 몬스터)을 등록하세요.
-  같은 종류의 몬스터가 여럿이면 "고블린A", "고블린B"처럼 구분되는 이름을 붙이세요. 누군가 공격을
-  받거나, 회복하거나, 새로 등장하거나, 쓰러지거나, 전투가 끝날 때마다 즉시 update_combat_status를
-  다시 호출해 전체 참가자 목록을 최신 상태로 갱신하세요 (부분 업데이트가 아니라 매번 전체를 다시
-  보내세요). 공격 서술과 상태 갱신이 같은 턴에 함께 반영되어야 합니다. 플레이어 본인의 HP는
-  update_character_sheet로 갱신한 값과 항상 일치시키세요.
+- 전투가 시작되면 먼저 update_combat_status 도구로 참가자 전원(플레이어, 동료 NPC, 적 몬스터)을
+  등록하세요. 같은 종류의 몬스터가 여럿이면 "고블린A", "고블린B"처럼 구분되는 이름을 붙이세요.
+  참가자가 새로 등장하거나 이탈할 때, 전투가 끝날 때(in_combat=false) 다시 호출하세요. 이미 등록된
+  참가자의 HP는 roll_attack/change_hp가 자동으로 관리하므로 update_combat_status로는 바뀌지 않습니다.
+- 한 답변 안에서 적의 턴까지 진행할 때도 적의 공격 하나하나를 roll_attack으로 처리한 뒤, 그 결과대로
+  서술하세요. 답변에 적는 HP 수치는 반드시 도구가 돌려준 값과 같아야 합니다.
+- 전투 참가자 전체의 HP·레벨 현황판은 시스템이 답변 끝에 자동으로 표시합니다. 답변 안에 참가자
+  HP 목록을 따로 나열하지 말고, 서술에서는 이번에 달라진 결과만 자연스럽게 언급하세요.
 - 생생하고 몰입감 있는 한국어로 서술하되, 장황하지 않게 핵심 위주로 진행하세요.
 """
 
@@ -72,8 +86,69 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "roll_attack",
+            "description": "공격 한 번을 실제로 굴려 판정합니다. 시스템이 d20을 굴려 대상 AC와 비교하고, 명중하면 "
+                           "피해 주사위를 굴려(자연 20이면 치명타로 주사위 2배) 대상 HP에 즉시 반영한 뒤 결과를 "
+                           "돌려줍니다. 적/동료 NPC의 공격은 반드시 이 도구로 처리하세요. 플레이어 캐릭터의 "
+                           "공격에는 쓰지 마세요(플레이어가 직접 굴립니다). 대상은 먼저 update_combat_status로 "
+                           "등록되어 있어야 합니다. 대상 AC는 캐릭터 시트나 룰북 몬스터 데이터에서 자동으로 "
+                           "찾으며, 룰북에 없는 대상이면 target_ac를 보내세요. 피해는 이미 반영되므로 같은 "
+                           "피해로 change_hp를 다시 호출하지 마세요.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "attacker": {"type": "string", "description": "공격자 이름 (예: '고블린B', '자크')"},
+                    "target": {"type": "string", "description": "대상 이름 (플레이어 캐릭터 이름 또는 전투 참가자 이름)"},
+                    "attack_bonus": {"type": "integer", "description": "명중 보너스 (예: 고블린 시미터는 +4 → 4)"},
+                    "damage": {"type": "string", "description": "피해 주사위 표기 (예: '1d6+2')"},
+                    "mode": {"type": "string", "enum": ["normal", "advantage", "disadvantage"]},
+                    "target_ac": {"type": "integer", "description": "룰북에 없는 대상일 때만 사용"},
+                },
+                "required": ["attacker", "target", "attack_bonus", "damage"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "change_hp",
+            "description": "정해진 양만큼 HP를 깎거나 회복합니다. 플레이어가 직접 굴려서 알려준 피해, 함정·주문 "
+                           "피해, 물약·휴식 회복 등에 사용하세요. roll_attack으로 이미 반영된 피해에는 쓰지 "
+                           "마세요. 플레이어면 캐릭터 시트에, 그 외에는 전투 상태에 즉시 반영하고 변경 전/후 "
+                           "HP를 돌려줍니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "대상 이름 (플레이어 캐릭터 이름 또는 전투 참가자 이름)"},
+                    "amount": {"type": "integer", "description": "양수로 된 피해량 또는 회복량"},
+                    "kind": {"type": "string", "enum": ["damage", "heal"]},
+                },
+                "required": ["target", "amount", "kind"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_rulebook_entry",
+            "description": "주문, 몬스터/NPC, 마법 물건 하나의 정확한 룰북 데이터(JSON)를 이름으로 조회합니다. "
+                           "룰북의 한국어 이름(예: '화염구', '고블린', '저항의 반지') 또는 영어 이름"
+                           "(예: 'Fireball')으로 찾을 수 있습니다. 못 찾으면 후보 이름 목록을 돌려줍니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["spell", "monster", "magic_item"]},
+                    "name": {"type": "string"},
+                },
+                "required": ["kind", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_rulebook",
-            "description": "D&D 5e 기초 룰북에서 규칙/주문/괴물 정보를 검색합니다.",
+            "description": "D&D 5e 기초 룰북 본문에서 일반 규칙(기습, 엄폐, 휴식, 상태이상 등)을 검색합니다.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -236,8 +311,170 @@ def render_combat_status(character_id: str) -> str:
     return "\n".join(lines)
 
 
-def _run_tool(name: str, args: dict) -> str:
+def _apply_monster_stats(combatants: list, previous: list) -> None:
+    """Force enemy HP max / CR to the rulebook stat block instead of trusting the
+    numbers the model typed in. Only exact name matches ("고블린A" -> 고블린) are
+    corrected; unknown or custom enemies are left as the model described them."""
+    known = {_squash(c.get("name")) for c in previous}
+    for c in combatants:
+        if c.get("side") != "enemy":
+            continue
+        stat = monster_for_label(c.get("name", ""))
+        if not stat or not stat.get("hit_points"):
+            continue
+        true_max = stat["hit_points"]
+        if _squash(c.get("name")) not in known and c.get("hp_current", 0) >= c.get("hp_max", 0):
+            c["hp_current"] = true_max  # newly registered at full health
+        c["hp_max"] = true_max
+        c["hp_current"] = min(c.get("hp_current", true_max), true_max)
+        c["level_or_cr"] = f"CR {stat['challenge_rating']}"
+
+
+# ---------- HP changes and attack rolls happen in code, not in the model's head ----------
+
+def _squash(s: str) -> str:
+    return re.sub(r"\s+", "", s or "")
+
+
+def _is_player(target: str, sheet: dict) -> bool:
+    return _squash(target) in {_squash(sheet.get("name", "")), "플레이어", "player", "당신"}
+
+
+def _find_combatant(target: str):
+    return next((c for c in _combat_state["combatants"] if _squash(c.get("name")) == _squash(target)), None)
+
+
+def _ensure_combatant(target: str):
+    """The registered combatant, auto-registering a rulebook monster ("고블린A") the
+    model attacked before calling update_combat_status, so that hit isn't lost."""
+    c = _find_combatant(target)
+    if c is not None:
+        return c
+    stat = monster_for_label(target)
+    if not stat or not stat.get("hit_points"):
+        return None
+    c = {
+        "name": target.strip(), "side": "enemy", "hp_current": stat["hit_points"],
+        "hp_max": stat["hit_points"], "level_or_cr": f"CR {stat['challenge_rating']}",
+    }
+    _combat_state["combatants"].append(c)
+    _combat_state["in_combat"] = True
+    return c
+
+
+# Damage roll_attack already applied during the current reply. The model tends to
+# "also" call change_hp with the same number afterwards, which would apply it twice.
+_applied_this_turn: list[tuple[str, int]] = []
+
+
+def change_hp(character_id: str, target: str, amount: int) -> dict:
+    """amount > 0: damage, amount < 0: healing. Updates the character sheet (player)
+    or the combat roster (everyone else) and returns before/after for narration."""
+    sheet = get_character(character_id) or {}
+    if _is_player(target, sheet):
+        hp = sheet.get("hit_points") or {}
+        before, hp_max = hp.get("current", 0), hp.get("max", 0)
+        after = max(0, min(hp_max, before - amount))
+        update_character(character_id, {"hit_points": {"current": after}})
+        for c in _combat_state["combatants"]:
+            if c.get("side") == "player":
+                c["hp_current"] = after
+        name = sheet.get("name")
+    else:
+        c = _ensure_combatant(target)
+        if c is None:
+            return {"error": f"'{target}'은(는) 전투 참가자로 등록되어 있지 않습니다. "
+                             "update_combat_status로 먼저 등록하세요."}
+        before, hp_max = c.get("hp_current", 0), c.get("hp_max", 0)
+        after = max(0, min(hp_max, before - amount))
+        c["hp_current"] = after
+        name = c["name"]
+    return {"target": name, "hp_before": before, "hp_after": after, "hp_max": hp_max, "down": after == 0}
+
+
+def _roll_dice(expr: str) -> tuple[list, int]:
+    m = re.fullmatch(r"\s*(\d*)\s*d\s*(\d+)\s*(?:([+-])\s*(\d+))?\s*", expr or "")
+    if not m:
+        raise ValueError(f"주사위 표기를 이해할 수 없습니다: {expr!r} (예: '1d6+2')")
+    count, sides = int(m.group(1) or 1), int(m.group(2))
+    bonus = int(m.group(4) or 0) * (-1 if m.group(3) == "-" else 1)
+    return [random.randint(1, sides) for _ in range(count)], bonus
+
+
+def _target_ac(character_id: str, target: str, given_ac):
+    sheet = get_character(character_id) or {}
+    if _is_player(target, sheet):
+        return sheet.get("armor_class")
+    stat = monster_for_label(target)
+    if stat and stat.get("armor_class"):
+        return stat["armor_class"]
+    return given_ac
+
+
+def roll_attack(character_id: str, attacker: str, target: str, attack_bonus: int, damage: str,
+                mode: str = "normal", target_ac=None) -> dict:
+    """d20 + bonus vs target AC; on a hit roll damage (dice doubled on a natural 20)
+    and apply it via change_hp so the narrated result and the recorded HP can't diverge."""
+    sheet = get_character(character_id) or {}
+    if _is_player(attacker, sheet) or attacker == character_id:
+        return {"error": "플레이어 캐릭터의 공격은 플레이어가 직접 굴립니다. 플레이어가 알려준 명중 굴림으로 "
+                         "판정하고 피해는 change_hp로 반영하세요. 아직 굴리지 않았다면 굴려달라고 요청하세요."}
+    if not _is_player(target, sheet) and _ensure_combatant(target) is None:
+        return {"error": f"'{target}'은(는) 전투 참가자로 등록되어 있지 않습니다. "
+                         "update_combat_status로 먼저 등록한 뒤 다시 굴리세요."}
+    ac = _target_ac(character_id, target, target_ac)
+    if ac is None:
+        return {"error": f"'{target}'의 AC를 알 수 없습니다. target_ac를 함께 보내주세요."}
+
+    d20s = [random.randint(1, 20)] if mode == "normal" else [random.randint(1, 20), random.randint(1, 20)]
+    natural = max(d20s) if mode == "advantage" else min(d20s)
+    total = natural + attack_bonus
+    hit = natural == 20 or (natural != 1 and total >= ac)
+    result = {
+        "attacker": attacker, "target": target, "d20": d20s, "natural": natural,
+        "attack_bonus": attack_bonus, "total": total, "target_ac": ac,
+        "hit": hit, "critical": natural == 20,
+    }
+    if not hit:
+        return result
+
+    dice, bonus = _roll_dice(damage)
+    if natural == 20:
+        extra, _ = _roll_dice(damage)
+        dice += extra
+    amount = max(0, sum(dice) + bonus)
+    result.update({"damage_dice": damage, "damage_rolls": dice, "damage": amount})
+    applied = change_hp(character_id, target, amount)
+    result.update(applied)
+    result["note"] = "피해는 이미 HP에 반영되었습니다. 같은 피해로 change_hp를 호출하지 마세요."
+    _applied_this_turn.append((_squash(target), amount))
+    return result
+
+
+def _run_tool(name: str, args: dict, character_id: str | None = None) -> str:
     try:
+        if name == "change_hp":
+            amount = abs(int(args["amount"]))
+            key = (_squash(args["target"]), amount)
+            if args.get("kind") != "heal" and key in _applied_this_turn:
+                return json.dumps({"skipped": "이 피해는 roll_attack에서 이미 HP에 반영되었습니다. 다시 깎지 않았습니다."},
+                                  ensure_ascii=False)
+            if args.get("kind") == "heal":
+                amount = -amount
+            return json.dumps(change_hp(character_id, args["target"], amount), ensure_ascii=False)
+
+        if name == "roll_attack":
+            return json.dumps(
+                roll_attack(
+                    character_id, args["attacker"], args["target"], int(args["attack_bonus"]), args["damage"],
+                    args.get("mode", "normal"), args.get("target_ac"),
+                ),
+                ensure_ascii=False,
+            )
+
+        if name == "lookup_rulebook_entry":
+            return json.dumps(lookup(args["kind"], args["name"]), ensure_ascii=False)
+
         if name == "search_rulebook":
             results = search_rulebook(args["query"], args.get("top_k", 5))
             trimmed = [
@@ -251,12 +488,30 @@ def _run_tool(name: str, args: dict) -> str:
             return json.dumps(sheet if sheet else {"error": "찾을 수 없음"}, ensure_ascii=False)
 
         if name == "update_character_sheet":
-            updated = update_character(args["character_id"], args["patch"])
-            return json.dumps(updated, ensure_ascii=False)
+            patch = args["patch"]
+            note = None
+            hp_patch = patch.get("hit_points")
+            if isinstance(hp_patch, dict) and "current" in hp_patch:
+                # current HP only moves through roll_attack / change_hp, which track what was applied
+                hp_patch.pop("current")
+                if not hp_patch:
+                    patch.pop("hit_points")
+                note = "현재 HP는 update_character_sheet로 바꿀 수 없어 무시했습니다. change_hp를 사용하세요."
+            updated = update_character(args["character_id"], patch)
+            return json.dumps({"sheet": updated, "note": note} if note else updated, ensure_ascii=False)
 
         if name == "update_combat_status":
+            combatants = args.get("combatants", [])
+            # HP of already-registered combatants belongs to roll_attack/change_hp; ignore
+            # whatever the model re-sends so a stale list can't undo damage already dealt.
+            previous = {_squash(c.get("name")): c for c in _combat_state["combatants"]}
+            for c in combatants:
+                prev = previous.get(_squash(c.get("name")))
+                if prev:
+                    c["hp_current"], c["hp_max"] = prev["hp_current"], prev["hp_max"]
+            _apply_monster_stats(combatants, _combat_state["combatants"])
             _combat_state["in_combat"] = bool(args.get("in_combat"))
-            _combat_state["combatants"] = args.get("combatants", [])
+            _combat_state["combatants"] = combatants
             return json.dumps({"status": "ok", **_combat_state}, ensure_ascii=False)
 
         return json.dumps({"error": f"알 수 없는 도구: {name}"})
@@ -271,7 +526,75 @@ def _last_user_message(messages: list) -> str:
     return ""
 
 
-def get_dm_response(messages: list) -> str:
+CONSISTENCY_SYSTEM_PROMPT = """당신은 TRPG 진행 기록의 정합성을 확인하는 검사자입니다.
+DM의 답변 초안과, 게임 시스템에 실제로 기록된 현재 상태(플레이어 HP, 전투 참가자 HP)를 비교하세요.
+
+- 답변에 나오는 HP 수치, 피해를 입은 결과, 쓰러짐/사망 여부가 실제 상태와 다르면 불일치입니다.
+  예) 답변은 "당신의 HP는 7/12"인데 실제 상태는 12/12
+  예) 답변은 "고블린A가 쓰러졌다"인데 실제 상태의 고블린A HP는 2/7
+  예) 답변에서 플레이어가 피해를 입었다고 했는데 실제 상태의 HP는 그대로
+- 답변에 수치나 결과가 언급되지 않은 참가자는 판단하지 마세요.
+- 전투나 피해와 무관한 답변(규칙 설명 등)이면 일치로 판정하세요.
+- 답변의 수치가 실제 상태와 같다면 그건 일치입니다. 불일치를 구체적으로 지적할 수 없으면
+  consistent를 true로 하세요.
+
+JSON으로만 답하세요: {"consistent": true 또는 false, "issues": "불일치 내용을 한국어로 짧게 (없으면 빈 문자열)"}
+"""
+
+CORRECTION_MESSAGE = """[시스템 확인] 방금 작성한 답변이 게임에 기록된 실제 상태와 다릅니다: {issues}
+서술한 사건(적의 공격 명중, 피해, 쓰러짐 등)은 그대로 유지하고, 그 결과를 update_character_sheet /
+update_combat_status로 상태에 반영하는 것을 우선하세요. 사건을 없던 일로 하거나 "명중했지만 피해는
+없다"처럼 규칙에 어긋나게 바꾸지 마세요. 서술 속 계산 실수(예: 7-5를 0으로 적음)만 실제 상태에 맞게
+고치세요. 그런 다음 플레이어에게 보여줄 전체 답변을 처음부터 다시 작성하세요. 이 확인 메시지 자체는
+답변에서 언급하지 마세요."""
+
+
+def _state_snapshot(character_id: str) -> dict:
+    sheet = get_character(character_id) or {}
+    hp = sheet.get("hit_points") or {}
+    return {
+        "player": {"name": sheet.get("name"), "hp_current": hp.get("current"), "hp_max": hp.get("max")},
+        "in_combat": _combat_state["in_combat"],
+        "other_combatants": [c for c in _combat_state["combatants"] if c.get("side") != "player"],
+    }
+
+
+def check_consistency(draft: str, character_id: str) -> str | None:
+    """Returns a description of narration/state mismatches, or None if they agree."""
+    resp = client.chat.completions.create(
+        model=MODEL,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": CONSISTENCY_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"DM 답변 초안:\n{draft}\n\n실제 상태:\n"
+                           f"{json.dumps(_state_snapshot(character_id), ensure_ascii=False)}",
+            },
+        ],
+    )
+    try:
+        result = json.loads(resp.choices[0].message.content or "{}")
+    except json.JSONDecodeError:
+        return None
+    if result.get("consistent", True):
+        return None
+    return result.get("issues") or "서술과 실제 상태가 다릅니다."
+
+
+def _mentions_hp_change(draft: str) -> bool:
+    return bool(re.search(r"hp|체력|피해|쓰러", draft, re.IGNORECASE))
+
+
+def get_dm_response(messages: list, character_id: str | None = None) -> str:
+    # The model sometimes calls its state-update tools first and then keeps narrating
+    # (e.g. plays out the enemy's turn), so the text and the recorded HP drift apart.
+    # Before showing a reply, compare it against the recorded state once; on a mismatch
+    # hand the issue back so the model fixes the state or the text, then drop the
+    # rejected draft and the correction note from history.
+    rejected = []  # indexes of rejected drafts + correction notes
+    _applied_this_turn.clear()
     while True:
         resp = client.chat.completions.create(
             model=MODEL, messages=messages, tools=TOOLS, tool_choice="auto", temperature=0.7
@@ -292,13 +615,26 @@ def get_dm_response(messages: list) -> str:
 
         if not msg.tool_calls:
             draft = msg.content or ""
+            if (
+                character_id
+                and len(rejected) < 4  # at most two correction rounds
+                and (_combat_state["in_combat"] or _mentions_hp_change(draft))
+            ):
+                issues = check_consistency(draft, character_id)
+                if issues:
+                    rejected.append(len(messages) - 1)
+                    messages.append({"role": "user", "content": CORRECTION_MESSAGE.format(issues=issues)})
+                    rejected.append(len(messages) - 1)
+                    continue
+            for idx in reversed(rejected):
+                del messages[idx]
             final = verify_reply(_last_user_message(messages), draft)
             messages[-1]["content"] = final  # keep history consistent with what the player saw
             return final
 
         for tc in msg.tool_calls:
             args = json.loads(tc.function.arguments or "{}")
-            result = _run_tool(tc.function.name, args)
+            result = _run_tool(tc.function.name, args, character_id)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
 
@@ -415,7 +751,7 @@ def main():
     else:
         messages = build_messages(character_id, scenario, story_summary, turn_history)
         messages.append({"role": "user", "content": "게임을 시작해줘."})
-        reply = get_dm_response(messages)
+        reply = get_dm_response(messages, character_id)
         print(f"DM> {reply}\n")
         status = render_combat_status(character_id)
         if status:
@@ -434,7 +770,7 @@ def main():
         messages.append({"role": "user", "content": user_input})
 
         try:
-            reply = get_dm_response(messages)
+            reply = get_dm_response(messages, character_id)
         except Exception as e:
             print(f"[오류] {e}")
             continue

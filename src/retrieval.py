@@ -36,13 +36,14 @@ def _build_name_index():
 
     coll = _get_collection()
     entries = []
-    for doc_type in ("spell", "monster"):
+    for doc_type in ("spell", "monster", "magic_item"):
         res = coll.get(where={"type": doc_type}, limit=1000)
         for chunk_id, meta in zip(res["ids"], res["metadatas"]):
-            for key in ("name", "name_en"):
-                name = (meta.get(key) or "").strip()
-                if len(name) >= 2:
-                    entries.append((name, chunk_id))
+            names = [(meta.get(key) or "").strip() for key in ("name", "name_en")]
+            # magic items are indexed as "반지, 저항의 반지"; players just say "저항의 반지"
+            if "," in names[0]:
+                names.append(names[0].split(",", 1)[1].strip())
+            entries.extend((n, chunk_id) for n in names if len(n) >= 2)
     # Longest names first so "지연 폭발 화염구" matches before plain "화염구".
     entries.sort(key=lambda e: len(e[0]), reverse=True)
     _name_index = entries

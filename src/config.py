@@ -8,6 +8,11 @@ RAW_DIR = ROOT_DIR / "data" / "raw"
 PAGES_JSON = RAW_DIR / "pages.json"
 CHUNKS_JSONL = RAW_DIR / "chunks.jsonl"
 
+STRUCTURED_DIR = ROOT_DIR / "data" / "structured"
+SPELLS_JSON = STRUCTURED_DIR / "spells.json"
+MONSTERS_JSON = STRUCTURED_DIR / "monsters.json"
+MAGIC_ITEMS_JSON = STRUCTURED_DIR / "magic_items.json"
+
 CHROMA_DIR = ROOT_DIR / "data" / "chroma_db"
 RULEBOOK_COLLECTION = "rulebook"
 CHARACTER_SHEET_COLLECTION = "character_sheets"
